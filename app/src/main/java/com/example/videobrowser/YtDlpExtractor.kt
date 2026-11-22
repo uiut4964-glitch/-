@@ -443,6 +443,17 @@ object YtDlpExtractor {
             // Match the canonical site-root headers used by yt-dlp's PornHub extractor.
             safe["Referer"] = "$pageOrigin/"
             safe["Origin"] = pageOrigin
+        } else if (isGayPorn(pageUrl)) {
+            // GayPorn serves higher renditions only when the request looks like a
+            // real browser page navigation: use the canonical page URL as Referer
+            // and keep the WebView User-Agent so the CDN does not throttle to 720p.
+            safe.remove("User-Agent")
+            val pageOrigin = try {
+                val uri = URI(pageUrl)
+                "${uri.scheme ?: "https"}://${uri.host ?: "www.gayporn.com"}"
+            } catch (_: Exception) { "https://www.gayporn.com" }
+            safe["Referer"] = pageOrigin
+            safe["Origin"] = pageOrigin
         } else if (host.isNotBlank()) {
             safe.putIfAbsent("Referer", pageUrl)
             safe.putIfAbsent("Origin", try { val u = URI(pageUrl); "${u.scheme}://${u.host}" } catch (_: Exception) { "" })
@@ -489,6 +500,11 @@ object YtDlpExtractor {
         val host = try { URI(url).host?.lowercase(Locale.ROOT).orEmpty() } catch (_: Exception) { "" }
         return listOf("pornhub.com", "pornhubpremium.com", "pornhub.net", "pornhub.org")
             .any { host == it || host.endsWith(".$it") }
+    }
+
+    private fun isGayPorn(url: String): Boolean {
+        val host = try { URI(url).host?.lowercase(Locale.ROOT).orEmpty() } catch (_: Exception) { "" }
+        return listOf("gayporn.com").any { host == it || host.endsWith(".$it") }
     }
 
     private fun extractJson(raw: String): JSONObject {
