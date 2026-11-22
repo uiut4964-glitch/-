@@ -1,0 +1,100 @@
+package com.example.videobrowser
+
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+
+class MediaItem(
+    val url: String,
+    val type: String,
+    val origin: String = "dom",
+    val videoId: String = "",
+    val sourceEpoch: Int = 0,
+    // Quality metadata copied from the site's player manifest/config. This is
+    // essential for opaque signed URLs that contain no 720p/1080p in the URL.
+    val qualityHint: String = "",
+    val widthHint: Int = 0,
+    val heightHint: Int = 0,
+    val mimeHint: String = "",
+    val requestHeaders: Map<String, String> = emptyMap(),
+    val captureSource: String = "",
+    val codecHint: String = "",
+    val frameRateHint: Double = 0.0,
+    val dynamicRangeHint: String = "",
+    val bandwidthHint: Long = 0L,
+    val representationIdHint: String = ""
+)
+
+class Format(
+    val label: String,
+    val details: String,
+    val url: String,
+    val kind: String,
+    val ext: String,
+    val fromMaster: Boolean = false,
+    val sizeText: String = "",
+    val isAudio: Boolean = false,
+    val durSec: Double = 0.0,
+    val bytes: Long = -1L,
+    val requestHeaders: Map<String, String> = emptyMap(),
+    val codec: String = "",
+    val frameRate: Double = 0.0,
+    val dynamicRange: String = "",
+    val bandwidth: Long = 0L,
+    val representationId: String = "",
+    val ytDlpPageUrl: String = "",
+    val ytDlpFormatId: String = ""
+)
+
+object St {
+    const val QUEUED = 0
+    const val DOWNLOADING = 1
+    const val PAUSED = 2
+    const val MERGING = 3
+    const val DONE = 4
+    const val FAILED = 5
+}
+
+class Task(
+    val id: String,
+    var url: String,
+    var name: String,
+    val kind: String,
+    var headers: Map<String, String>
+) {
+    @Volatile var notice = ""
+    var total = -1L
+    var parts = 0
+    @Volatile var status = St.QUEUED
+    @Volatile var error = ""
+    var savedUri = ""
+    var created = System.currentTimeMillis()
+    var mime = "video/mp4"
+    var segCount = 0
+    @Volatile var expectedDurationSec = 0.0
+    @Volatile var segmentDurations: DoubleArray? = null
+    @Volatile var segmentDiscontinuities: BooleanArray? = null
+    @Volatile var hasHlsDiscontinuity = false
+    var rangeOk = false
+    var thumbUrl = ""
+    // Preserve the yt-dlp page/format choice so the download uses the same curl_cffi transport.
+    var ytDlpPageUrl = ""
+    var ytDlpFormatId = ""
+    @Volatile var ytDlpDownloadedOutput = false
+    @Volatile var partDone: LongArray? = null
+    var partSize: LongArray? = null
+    @Volatile var segState: BooleanArray? = null
+    val downloaded = AtomicLong(0)
+    val segDone = AtomicInteger(0)
+    @Volatile var speed = 0L
+    @Volatile var stop = false
+    @Volatile var gen = 0
+    var lastBytes = 0L
+    val lock = Any()
+
+    fun permille(): Int =
+        if (kind == "hls" && ytDlpPageUrl.isBlank() && !ytDlpDownloadedOutput) {
+            if (segCount > 0) (segDone.get() * 1000L / segCount).toInt() else 0
+        } else {
+            if (total > 0) (downloaded.get() * 1000L / total).toInt() else 0
+        }
+}

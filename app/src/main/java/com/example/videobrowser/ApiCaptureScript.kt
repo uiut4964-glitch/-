@@ -1,0 +1,736 @@
+package com.example.videobrowser
+
+/**
+ * Installed by WebViewCompat at document-start in the main frame and matching child frames.
+ * Child-frame payloads go to the native WebMessageListener, never to the parent page via postMessage.
+ * It observes only bounded text-like API/manifest responses; media bytes are never read.
+ */
+internal const val EARLY_API_CAPTURE_JS = """
+(function () {
+  'use strict';
+  try {
+    var frameIsTop = false;
+    try { frameIsTop = window === window.top; } catch (_) { frameIsTop = false; }
+    var currentProtocol = String(location.protocol || '').toLowerCase();
+    // about:blank/srcdoc child frames can inherit the embedding page's origin and may
+    // host the actual player. Do not skip those frames merely because their URL is about:.
+    if (!/^https?:$/.test(currentProtocol) && !(currentProtocol === 'about:' && !frameIsTop)) return;
+    // Do not return when another copy already wrapped Fetch/XHR: the frame/video
+    // observer below is independently installed and must still get a chance to run.
+    window.__vbApiObserverInstalled = true;
+    window.__vbApiPayloads = window.__vbApiPayloads || [];
+
+    var MAX_TEXT = 700000;
+    var MAX_ITEMS = 16;
+    var SAFE_HEADERS = ['accept', 'accept-language'];
+    var RELEVANT = /#EXTM3U|(?:sources|qualities|renditions|formats|m3u8|mpd|video[_-]?url|videoUrl|contentUrl|resolution|height|playbackUrl)/i;
+
+    function absoluteUrl(raw) {
+      try { return new URL(String(raw || ''), location.href).href; }
+      catch (_) { return ''; }
+    }
+
+    function cleanPageUrl(raw) {
+      try {
+        var u = new URL(String(raw || location.href));
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+        u.search = '';
+        u.hash = '';
+        return u.href;
+      } catch (_) { return ''; }
+    }
+
+    function safeHeaders(rawHeaders) {
+      var result = {};
+      try {
+        if (rawHeaders) {
+          var h = new Headers(rawHeaders);
+          for (var i = 0; i < SAFE_HEADERS.length; i++) {
+            var name = SAFE_HEADERS[i];
+            var value = h.get(name);
+            if (value) result[name === 'accept' ? 'Accept' : 'Accept-Language'] = String(value).slice(0, 4096);
+          }
+        }
+      } catch (_) {}
+      // These are page context, not credential headers. Never copy Cookie or Authorization.
+      var referer = cleanPageUrl(location.href);
+      if (referer) result.Referer = referer;
+      try {
+        if (location.origin && location.origin !== 'null') result.Origin = String(location.origin).slice(0, 4096);
+      } catch (_) {}
+      return result;
+    }
+
+    function isCandidateResponse(url, contentType, response) {
+      var ct = String(contentType || '').toLowerCase();
+      var value = String(url || '').toLowerCase();
+      var manifestPath = /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(value);
+      if (/^(?:video|audio|image)\//i.test(ct)) return false;
+      if (/application\/octet-stream/i.test(ct) && !manifestPath) return false;
+      if (manifestPath) return true;
+      if (/(?:json|text|xml|mpegurl|dash\+xml)/i.test(ct)) return true;
+      // Some cross-origin APIs do not expose Content-Type to JavaScript.
+      return /(?:\/api\/|\/graphql|player|video|stream|manifest|quality|qualities|rendition|playback|source|format)/i.test(value);
+    }
+
+    function putOnTop(payload) {
+      try {
+        var isTop = window === window.top;
+        if (!isTop) {
+          // Cross-origin payloads must not be exposed to the embedding page's message listeners.
+          // WebViewCompat injects this native bridge into matching frames when supported.
+          var bridge = window.VideoBrowserCapture;
+          if (bridge && typeof bridge.postMessage === 'function') {
+            bridge.postMessage(JSON.stringify(payload));
+          }
+          return;
+        }
+        // Same-frame payloads stay in this frame's private queue for SCAN_JS.
+        acceptPayload(payload, payload.frameOrigin || location.origin);
+      } catch (_) {}
+    }
+
+    function acceptPayload(payload, sourceOrigin) {
+      try {
+        if (!payload || typeof payload !== 'object') return;
+        var requestUrl = absoluteUrl(payload.url);
+        var text = typeof payload.text === 'string' ? payload.text : '';
+        if (!requestUrl || !/^https?:/i.test(requestUrl) || !text || text.length > MAX_TEXT || !RELEVANT.test(text)) return;
+        var expectedOrigin = String(payload.frameOrigin || '');
+        if (sourceOrigin && expectedOrigin && sourceOrigin !== expectedOrigin) return;
+        var list = window.__vbApiPayloads || (window.__vbApiPayloads = []);
+        var key = requestUrl + '|' + String(payload.method || 'GET') + '|' + text.length + '|' + text.substring(0, 96);
+        if (list.some(function (item) { return item && item.key === key; })) return;
+        list.push({
+          key: key,
+          url: requestUrl,
+          text: text,
+          at: Number(payload.at || Date.now()),
+          type: String(payload.type || ''),
+          method: String(payload.method || 'GET').toUpperCase(),
+          headers: payload.headers && typeof payload.headers === 'object' ? payload.headers : {},
+          source: String(payload.source || 'fetch-api'),
+          frameOrigin: expectedOrigin
+        });
+        while (list.length > MAX_ITEMS) list.shift();
+      } catch (_) {}
+    }
+
+    function rememberPayload(url, text, contentType, method, headers, source) {
+      try {
+        if (!text || text.length > MAX_TEXT || !RELEVANT.test(text)) return;
+        putOnTop({
+          url: absoluteUrl(url),
+          text: text,
+          at: Date.now(),
+          type: String(contentType || ''),
+          method: String(method || 'GET').toUpperCase(),
+          headers: headers || {},
+          source: source || 'fetch-api',
+          frameOrigin: String(location.origin || '')
+        });
+      } catch (_) {}
+    }
+
+    function boundedText(response) {
+      var copy;
+      try { copy = response.clone(); } catch (_) { return Promise.resolve(null); }
+      var declaredLength = -1;
+      try {
+        var rawLength = copy.headers && copy.headers.get('content-length');
+        if (rawLength !== null && rawLength !== undefined && rawLength !== '') {
+          declaredLength = Number(rawLength);
+        }
+        if (Number.isFinite(declaredLength) && declaredLength > MAX_TEXT) return Promise.resolve(null);
+      } catch (_) {}
+      try {
+        if (copy.body && typeof copy.body.getReader === 'function' && typeof TextDecoder !== 'undefined') {
+          return (async function () {
+            var reader = copy.body.getReader();
+            var chunks = [];
+            var total = 0;
+            try {
+              while (true) {
+                var part = await reader.read();
+                if (part.done) break;
+                if (!part.value) continue;
+                total += part.value.byteLength;
+                if (total > MAX_TEXT) {
+                  try { await reader.cancel(); } catch (_) {}
+                  return null;
+                }
+                chunks.push(part.value);
+              }
+              var joined = new Uint8Array(total);
+              var offset = 0;
+              for (var i = 0; i < chunks.length; i++) {
+                joined.set(chunks[i], offset);
+                offset += chunks[i].byteLength;
+              }
+              return new TextDecoder('utf-8').decode(joined);
+            } catch (_) { return null; }
+          })();
+        }
+      } catch (_) {}
+      // Without a streaming reader, do not materialize an unknown-size response body.
+      // Older WebView fallback is allowed only when Content-Length proves it is bounded.
+      if (!Number.isFinite(declaredLength) || declaredLength < 0 || declaredLength > MAX_TEXT) {
+        return Promise.resolve(null);
+      }
+      try {
+        return copy.text().then(function (text) {
+          return text && text.length <= MAX_TEXT ? text : null;
+        }).catch(function () { return null; });
+      } catch (_) { return Promise.resolve(null); }
+    }
+
+    if (typeof window.fetch === 'function' && !window.fetch.__vbEarlyCaptureWrapped) {
+      var originalFetch = window.fetch;
+      var wrappedFetch = function (input, init) {
+        var requestUrl = '';
+        var method = 'GET';
+        var requestHeaders = {};
+        try {
+          requestUrl = typeof input === 'string' || input instanceof URL ? String(input) : String((input && input.url) || '');
+          method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+          requestHeaders = safeHeaders(init && Object.prototype.hasOwnProperty.call(init, 'headers') ? init.headers : (input && input.headers));
+        } catch (_) {}
+        return originalFetch.apply(this, arguments).then(function (response) {
+          try {
+            var contentType = response && response.headers ? (response.headers.get('content-type') || '') : '';
+            var finalUrl = response && response.url ? response.url : requestUrl;
+            if (response && isCandidateResponse(finalUrl || requestUrl, contentType, response)) {
+              boundedText(response).then(function (text) {
+                if (text) rememberPayload(finalUrl || requestUrl, text, contentType, method, requestHeaders, 'fetch-api');
+              }).catch(function () {});
+            }
+          } catch (_) {}
+          return response;
+        });
+      };
+      wrappedFetch.__vbEarlyCaptureWrapped = true;
+      wrappedFetch.__vbOriginal = originalFetch;
+      window.fetch = wrappedFetch;
+    }
+
+    if (window.XMLHttpRequest && window.XMLHttpRequest.prototype && !window.XMLHttpRequest.prototype.__vbEarlyCaptureWrapped) {
+      var xhrProto = window.XMLHttpRequest.prototype;
+      var originalOpen = xhrProto.open;
+      var originalSend = xhrProto.send;
+      var originalSetRequestHeader = xhrProto.setRequestHeader;
+      xhrProto.open = function (method, url) {
+        try {
+          this.__vbCapture = {
+            url: absoluteUrl(url),
+            method: String(method || 'GET').toUpperCase(),
+            headers: safeHeaders(null)
+          };
+        } catch (_) { this.__vbCapture = null; }
+        return originalOpen.apply(this, arguments);
+      };
+      if (typeof originalSetRequestHeader === 'function') {
+        xhrProto.setRequestHeader = function (name, value) {
+          try {
+            var key = String(name || '').toLowerCase();
+            if (key === 'accept') this.__vbCapture && (this.__vbCapture.headers.Accept = String(value).slice(0, 4096));
+            if (key === 'accept-language') this.__vbCapture && (this.__vbCapture.headers['Accept-Language'] = String(value).slice(0, 4096));
+          } catch (_) {}
+          return originalSetRequestHeader.apply(this, arguments);
+        };
+      }
+      xhrProto.send = function () {
+        var xhr = this;
+        try {
+          var state = xhr.__vbCapture;
+          if (state) {
+            xhr.addEventListener('load', function () {
+              try {
+                var contentType = xhr.getResponseHeader('content-type') || '';
+                if (!isCandidateResponse(xhr.responseURL || state.url, contentType, xhr)) return;
+                var body = '';
+                if (xhr.responseType === '' || xhr.responseType === 'text') body = xhr.responseText || '';
+                else if (xhr.responseType === 'json' && xhr.response) body = JSON.stringify(xhr.response);
+                if (body && body.length <= MAX_TEXT) {
+                  rememberPayload(xhr.responseURL || state.url, body, contentType, state.method, state.headers, 'xhr-api');
+                }
+              } catch (_) {}
+            }, { once: true });
+          }
+        } catch (_) {}
+        return originalSend.apply(this, arguments);
+      };
+      xhrProto.__vbEarlyCaptureWrapped = true;
+    }
+
+    // Cross-origin players may contain the only VIDEO element while the top document has none.
+    // Report bounded, non-secret player state directly to the native WebMessageListener.
+    if (!window.__vbFrameVideoObserverInstalled) {
+      window.__vbFrameVideoObserverInstalled = true;
+      var frameId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+      var frameVideoCounter = 0;
+      var frameVideoLast = Object.create(null);
+      var pointerState = { x: -1, y: -1, at: 0 };
+      var frameAdPattern = /(?:doubleclick|googlesyndication|googleadservices|imasdk|vasttag|adservice|adserver|adtng|preroll|midroll|postroll)/i;
+      var frameAdDefinitionPattern = /(?:^|[\/_.?&=-])(ads?|advert|advertisement|preroll|midroll|postroll|vast|vmap)(?:[\/_.?&=-]|$)/i;
+      var observedRoots = [];
+      var scanScheduled = false;
+      var frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [], videoDuration: 0, explicitAd: false,
+        xhamsterStateFound: false, xhamsterSourceCount: 0, xhamsterQualities: [], xhamsterOpaqueCount: 0, xhamsterSeen: Object.create(null) };
+
+      function sendFrameProbe(phase, lightCount, shadowCount, rootCount) {
+        try {
+          var bridge = window.VideoBrowserCapture;
+          if (!bridge || typeof bridge.postMessage !== 'function') return false;
+          bridge.postMessage(JSON.stringify({
+            kind: 'frame-probe', frameId: frameId, frameOrigin: String(location.origin || ''),
+            phase: String(phase || 'scan'), protocol: currentProtocol,
+            isTop: frameIsTop, readyState: String(document.readyState || ''),
+            lightVideoCount: Number(lightCount || 0), shadowVideoCount: Number(shadowCount || 0),
+            shadowRootCount: Number(rootCount || 0), bridgeReady: true, at: Date.now()
+          }));
+          return true;
+        } catch (_) { return false; }
+      }
+
+      // A probe is emitted even when no <video> element exists. This distinguishes
+      // injection/bridge failures from canvas players and DOM/Shadow-DOM discovery gaps.
+      sendFrameProbe('document-start', 0, 0, 0);
+
+      function frameVisible(video) {
+        try {
+          var style = getComputedStyle(video);
+          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) return false;
+          var r = video.getBoundingClientRect();
+          return r.width >= 70 && r.height >= 45 && r.right > 0 && r.bottom > 0 &&
+            r.left < window.innerWidth && r.top < window.innerHeight;
+        } catch (_) { return false; }
+      }
+
+      function frameAd(video, src) {
+        if (frameAdPattern.test(String(src || '')) || frameFlashvarsStats.explicitAd) return true;
+        try {
+          var node = video;
+          for (var depth = 0; node && depth < 7; depth++, node = node.parentElement) {
+            var marker = String(node.id || '') + ' ' + String(node.className || '') + ' ' +
+              String(node.getAttribute && (node.getAttribute('data-ad') || node.getAttribute('data-ad-playing')) || '');
+            if (/(^|[\s_-])(ima-ad-container|video-ads|ad-container|ad-player|ad-playing|advertisement|jw-ad|vjs-ad-playing|ad-showing|preroll|midroll|postroll)(?=$|[\s_-])/i.test(marker)) return true;
+          }
+        } catch (_) {}
+        var playerDuration = Number(frameFlashvarsStats.videoDuration || 0);
+        var currentDuration = Number(video && video.duration || 0);
+        if (playerDuration > 20 && currentDuration > 0 &&
+            currentDuration < playerDuration - Math.max(15, playerDuration * 0.15) &&
+            currentDuration / playerDuration < 0.80) return true;
+        return false;
+      }
+
+      function frameMediaSources(video) {
+        var result = [];
+        var seen = Object.create(null);
+        function add(raw, meta) {
+          try {
+            var value = String(raw || '').trim();
+            if (!value || /^blob:/i.test(value) || /^data:/i.test(value)) return;
+            var url = new URL(value, document.baseURI).href;
+            if (!/^https?:/i.test(url) || frameAdPattern.test(url) || isPreviewFrameUrl(url)) return;
+            if (!seen[url] && result.length < 32) {
+              seen[url] = true;
+              result.push({ url: url, meta: meta || {} });
+            }
+          } catch (_) {}
+        }
+        function isPreviewFrameUrl(url) {
+          return /(?:^|[\/_.?&=-])(preview|thumbnail|thumb|poster|trailer|teaser|sprite)(?:[\/_.?&=-]|$)/i.test(String(url || ''));
+        }
+        try {
+          add(video.currentSrc || video.getAttribute('src'), {
+            mime: 'video', width: Number(video.videoWidth || 0), height: Number(video.videoHeight || 0)
+          });
+        } catch (_) {}
+        try {
+          var children = video.querySelectorAll('source[src],source[data-src]');
+          for (var i = 0; i < Math.min(children.length, 32); i++) {
+            var node = children[i];
+            var label = node.getAttribute('label') || node.getAttribute('data-quality') || '';
+            var height = Number(node.getAttribute('data-height') || node.getAttribute('height') || 0);
+            var type = node.getAttribute('type') || '';
+            add(node.getAttribute('src') || node.getAttribute('data-src'), { label: label, height: height, mime: type });
+          }
+        } catch (_) {}
+        try {
+          var node = video.parentElement;
+          for (var depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+            ['data-video-url','data-stream-url','data-hls','data-m3u8','data-file','data-src'].forEach(function(attr){
+              var raw = node.getAttribute && node.getAttribute(attr);
+              if (raw) add(raw, { mime: /m3u8/i.test(attr) ? 'application/vnd.apple.mpegurl' : '' });
+            });
+          }
+        } catch (_) {}
+        // Read only explicit mediaDefinitions from named flashvars objects. This supports
+        // MSE players whose VIDEO.currentSrc is blob: but whose player config lists HLS/MP4 renditions.
+        try {
+          var names = Object.keys(window).filter(function(name){ return /^flashvars(?:_\d+)?$/i.test(name); }).slice(0, 12);
+          frameFlashvarsStats.objects = Math.max(frameFlashvarsStats.objects, names.length);
+          for (var fi = 0; fi < names.length; fi++) {
+            var config = window[names[fi]];
+            if (!config || typeof config !== 'object') continue;
+            var declaredDuration = Number(config.video_duration || config.videoDuration || config.duration || 0);
+            if (Number.isFinite(declaredDuration) && declaredDuration > frameFlashvarsStats.videoDuration && declaredDuration < 86400) {
+              frameFlashvarsStats.videoDuration = declaredDuration;
+            }
+            var adFlagNames = ['isAdPlaying','adPlaying','adActive','isAd','prerollActive','isPreroll','adBreakActive'];
+            for (var af = 0; af < adFlagNames.length; af++) {
+              var adValue = config[adFlagNames[af]];
+              if (adValue === true || adValue === 1 || /^(playing|active|preroll)$/i.test(String(adValue || ''))) frameFlashvarsStats.explicitAd = true;
+            }
+            var definitions = config.mediaDefinitions;
+            if (!Array.isArray(definitions)) continue;
+            frameFlashvarsStats.definitions = Math.max(frameFlashvarsStats.definitions, definitions.length);
+            for (var di = 0; di < Math.min(definitions.length, 64); di++) {
+              var def = definitions[di];
+              if (!def || typeof def !== 'object') continue;
+              var mediaUrl = def.videoUrl || def.video_url || def.url || '';
+              if (!mediaUrl) continue;
+              var format = String(def.format || def.type || '').toLowerCase();
+              var q = Array.isArray(def.quality) ? 0 : Number(String(def.quality || '').match(/\d{3,4}/)?.[0] || 0);
+              var defRole = String(def.role || '').toLowerCase();
+              if (def.isAd === true || def.ad === true || defRole === 'ad' || defRole === 'advertisement' ||
+                  frameAdPattern.test(mediaUrl) || frameAdDefinitionPattern.test(mediaUrl)) continue;
+              if (q > 0 && frameFlashvarsStats.qualities.indexOf(q + 'p') < 0 && frameFlashvarsStats.qualities.length < 16) {
+                frameFlashvarsStats.qualities.push(q + 'p');
+              }
+              add(mediaUrl, {
+                label: q > 0 ? q + 'p' : '', height: q > 0 ? q : 0,
+                mime: /^(hls|m3u8|mpegurl)$/.test(format) ? 'application/vnd.apple.mpegurl' :
+                  (/^(mp4|webm|quicktime)$/.test(format) ? 'video/' + format : ''),
+                codec: def.codecs || def.codec || '', frameRate: Number(def.frameRate || def.fps || 0),
+                bandwidth: Number(def.bandwidth || def.bitrate || 0),
+                representationId: def.id || def.formatId || '', captureSource: 'player-flashvars'
+              });
+            }
+          }
+        } catch (_) {}
+        // xHamster keeps exposed source maps in initials.videoModel.sources and
+        // xplayerSettings.sources. Read only these named structures and plain HTTP(S) URLs.
+        // Encoded/opaque values are counted for diagnostics but are never decoded.
+        try {
+          var xhInitials = window.initials;
+          if (!xhInitials && typeof initials !== 'undefined') xhInitials = initials;
+          if (xhInitials && typeof xhInitials === 'object') {
+            var xhModel = xhInitials.videoModel && typeof xhInitials.videoModel === 'object' ? xhInitials.videoModel : null;
+            var xhDuration = Number(xhModel && (xhModel.duration || xhModel.videoDuration || xhModel.video_duration) || xhInitials.videoDuration || 0);
+            if (Number.isFinite(xhDuration) && xhDuration > 20 && xhDuration < 86400 && xhDuration > frameFlashvarsStats.videoDuration) {
+              frameFlashvarsStats.videoDuration = xhDuration;
+            }
+            var xhModelSources = xhModel && xhModel.sources && typeof xhModel.sources === 'object' ? xhModel.sources : null;
+            var xhSettingsSources = xhInitials.xplayerSettings && xhInitials.xplayerSettings.sources &&
+              typeof xhInitials.xplayerSettings.sources === 'object' ? xhInitials.xplayerSettings.sources : null;
+            frameFlashvarsStats.xhamsterStateFound = !!(xhModelSources || xhSettingsSources);
+            var xhVisited = [];
+            var xhNodes = 0;
+            var xhDirectKeys = ['url','videoUrl','video_url','src','file','link','playbackUrl','playback_url',
+              'fallback','manifest','playlist','streamUrl','stream_url','hlsUrl','hls_url'];
+            function xhAddFrameUrl(raw, formatName, qualityHint, item) {
+              var value = String(raw || '').trim();
+              if (!value) return;
+              if (!/^https?:\/\//i.test(value)) {
+                if (/^[a-f0-9]{24,}$/i.test(value) && !frameFlashvarsStats.xhamsterSeen[value]) {
+                  frameFlashvarsStats.xhamsterSeen[value] = true;
+                  frameFlashvarsStats.xhamsterOpaqueCount++;
+                }
+                return;
+              }
+              var normalized = '';
+              try { normalized = new URL(value, document.baseURI).href; } catch (_) { return; }
+              if (!/^https?:/i.test(normalized) || frameAdPattern.test(normalized) || isPreviewFrameUrl(normalized)) return;
+              var meta = {};
+              if (item && typeof item === 'object') {
+                var w = Number(item.width || item.videoWidth || item.w || 0);
+                var h = Number(item.height || item.videoHeight || item.video_height || item.h || 0);
+                if ((!w || !h) && typeof item.resolution === 'string') {
+                  var dm = /(\d{3,5})\s*[x×]\s*(\d{3,5})/i.exec(item.resolution);
+                  if (dm) { w = w || Number(dm[1]); h = h || Number(dm[2]); }
+                }
+                if (w > 0) meta.width = w;
+                if (h > 0) meta.height = h;
+                if (item.codec || item.codecs) meta.codec = String(item.codec || item.codecs).slice(0, 160);
+                if (item.frameRate || item.fps) meta.frameRate = Number(item.frameRate || item.fps) || 0;
+                if (item.bandwidth || item.bitrate) meta.bandwidth = Number(item.bandwidth || item.bitrate) || 0;
+                if (item.id || item.formatId) meta.representationId = String(item.id || item.formatId).slice(0, 100);
+                if (item.dynamicRange || item.videoRange || item.hdr) meta.dynamicRange = String(item.dynamicRange || item.videoRange || item.hdr).slice(0, 80);
+              }
+              var qText = [qualityHint || '', item && item.quality || '', item && item.qualityLabel || '', item && item.resolution || ''].join(' ');
+              var dims = /(\d{3,5})\s*[x×]\s*(\d{3,5})/i.exec(qText);
+              var qm = /(?:^|[^0-9])(\d{3,4})\s*p?(?:$|[^0-9])/i.exec(qText);
+              var q = Number(meta.height || (dims ? dims[2] : 0) || (qm ? qm[1] : 0) || 0);
+              var label = q > 0 ? q + 'p' : (/\b(?:2k|qhd|4k|uhd)\b/i.test(qText) ? (qText.match(/\b(?:2k|qhd|4k|uhd)\b/i) || [''])[0].toUpperCase() : '');
+              if (q > 0) meta.height = q;
+              if (label) meta.label = label;
+              var fmt = String(formatName || '').toLowerCase();
+              if (/hls|m3u8/.test(fmt)) meta.mime = 'application/vnd.apple.mpegurl';
+              else if (/mp4|h264|avc|av1|standard/.test(fmt)) meta.mime = meta.mime || 'video/mp4';
+              if (/h264|avc/.test(fmt)) meta.codec = meta.codec || 'H.264';
+              else if (/av1/.test(fmt)) meta.codec = meta.codec || 'AV1';
+              meta.captureSource = 'player-xhamster';
+              if (label && frameFlashvarsStats.xhamsterQualities.indexOf(label) < 0 && frameFlashvarsStats.xhamsterQualities.length < 24) {
+                frameFlashvarsStats.xhamsterQualities.push(label);
+              }
+              if (frameFlashvarsStats.xhamsterSeen[normalized]) return;
+              frameFlashvarsStats.xhamsterSeen[normalized] = true;
+              add(normalized, meta);
+              if (result.some(function(entry){ return entry.url === normalized; })) frameFlashvarsStats.xhamsterSourceCount++;
+            }
+            function xhWalkFrame(node, formatName, qualityHint, depth) {
+              if (node == null || depth > 6 || xhNodes++ > 260) return;
+              if (typeof node === 'string') { xhAddFrameUrl(node, formatName, qualityHint, null); return; }
+              if (typeof node !== 'object' || xhVisited.indexOf(node) >= 0) return;
+              xhVisited.push(node);
+              if (Array.isArray(node)) {
+                for (var ai = 0; ai < Math.min(node.length, 48); ai++) xhWalkFrame(node[ai], formatName, qualityHint, depth + 1);
+                return;
+              }
+              var objectQuality = node.quality || node.qualityLabel || node.resolution || node.height || qualityHint || '';
+              for (var uk = 0; uk < xhDirectKeys.length; uk++) {
+                var direct = node[xhDirectKeys[uk]];
+                if (typeof direct === 'string') xhAddFrameUrl(direct, formatName, objectQuality, node);
+              }
+              var keys = Object.keys(node);
+              for (var ki = 0; ki < Math.min(keys.length, 64); ki++) {
+                var key = keys[ki];
+                if (xhDirectKeys.indexOf(key) >= 0 || /^(?:download|downloadUrl|download_url|ads?|advertisement|preview|thumbnail|thumb|poster|trailer|teaser|token|signature|cookie|authorization)$/i.test(key)) continue;
+                var child = node[key];
+                if (child == null || typeof child === 'boolean' || typeof child === 'number') continue;
+                var nextFormat = /^(?:hls|m3u8|mp4|webm|h264|avc|av1|standard)$/i.test(key) ? key : formatName;
+                var nextQuality = /(?:^|[^0-9])(?:\d{3,4}\s*p?|2k|qhd|4k|uhd)(?:$|[^a-z0-9])/i.test(key) ? key : objectQuality;
+                xhWalkFrame(child, nextFormat, nextQuality, depth + 1);
+              }
+            }
+            if (xhModelSources) {
+              var groupKeys = Object.keys(xhModelSources);
+              for (var gi = 0; gi < Math.min(groupKeys.length, 20); gi++) {
+                var groupName = groupKeys[gi];
+                if (/^(?:download|ads?|advertisement|preview|thumbnail|trailer)$/i.test(groupName)) continue;
+                xhWalkFrame(xhModelSources[groupName], groupName, '', 0);
+              }
+            }
+            if (xhSettingsSources) {
+              var settingsKeys = Object.keys(xhSettingsSources);
+              for (var si = 0; si < Math.min(settingsKeys.length, 20); si++) {
+                var settingsName = settingsKeys[si];
+                if (/download|ad|preview|trailer/i.test(settingsName) || !/(?:standard|h264|avc|av1|hls|mp4|source|quality)/i.test(settingsName)) continue;
+                xhWalkFrame(xhSettingsSources[settingsName], settingsName, '', 0);
+              }
+            }
+          }
+        } catch (_) {}
+        // Resource Timing contains old preroll manifests as well as content manifests.
+        // Remember the ad -> content boundary and ignore manifest entries older than it.
+        var frameAdNowForTiming = frameAd(video, video.currentSrc || video.getAttribute('src') || '');
+        if (frameAdNowForTiming) {
+          video.__vbFrameWasAd = true;
+          video.__vbFrameContentTransitionAt = 0;
+        } else if (video.__vbFrameWasAd === true) {
+          video.__vbFrameContentTransitionAt = Date.now();
+          video.__vbFrameWasAd = false;
+        }
+        var frameContentTransitionAt = Number(video.__vbFrameContentTransitionAt || 0);
+        // Recover the active manifest used by a Blob/MSE player from Resource Timing.
+        // Only manifest URLs are retained; segment URLs and response bodies are never read.
+        try {
+          var entries = performance && performance.getEntriesByType ? performance.getEntriesByType('resource') : [];
+          var now = Date.now();
+          for (var pe = Math.max(0, entries.length - 320); pe < entries.length; pe++) {
+            var entry = entries[pe];
+            var resourceUrl = String(entry && entry.name || '');
+            if (!/^https?:/i.test(resourceUrl) || frameAdPattern.test(resourceUrl) || isPreviewFrameUrl(resourceUrl)) continue;
+            var path = '';
+            try { path = new URL(resourceUrl).pathname.toLowerCase(); } catch (_) {}
+            if (!/\.(m3u8|mpd)$/.test(path) && !/(?:^|[\/_-])(manifest|playlist)(?:[\/_-]|$)/.test(path) &&
+                !/[?&](?:format|type|mime|contenttype)=[^&]*(?:m3u8|mpegurl|dash|mpd)/i.test(resourceUrl)) continue;
+            var entryAt = Number(performance.timeOrigin || 0) + Number(entry.startTime || 0);
+            var age = now - entryAt;
+            if (age < -5000 || age > 180000 || result.some(function(item){ return item.url === resourceUrl; })) continue;
+            if (frameContentTransitionAt > 0 && entryAt < frameContentTransitionAt - 1200) continue;
+            result.push({url:resourceUrl, meta:{mime:/mpd/i.test(path) ? 'application/dash+xml' : 'application/vnd.apple.mpegurl', captureSource:'performance-manifest'}});
+            if (result.length >= 32) break;
+          }
+        } catch (_) {}
+        return result;
+      }
+
+      function observeShadowRoot(root) {
+        try {
+          if (!root || observedRoots.indexOf(root) >= 0 || !window.MutationObserver) return;
+          if (observedRoots.length >= 24) return;
+          observedRoots.push(root);
+          var observer = new MutationObserver(scheduleFrameScan);
+          observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['src','data-src','class','style'] });
+        } catch (_) {}
+      }
+
+      function collectFrameVideos() {
+        var result = [];
+        var roots = [document];
+        var seenRoots = [];
+        var shadowRoots = 0;
+        var scannedNodes = 0;
+        for (var ri = 0; ri < roots.length && ri < 24 && scannedNodes < 2600; ri++) {
+          var root = roots[ri];
+          if (!root || seenRoots.indexOf(root) >= 0) continue;
+          seenRoots.push(root);
+          observeShadowRoot(root);
+          try {
+            var directVideos = root.querySelectorAll('video');
+            for (var vi = 0; vi < directVideos.length && result.length < 12; vi++) {
+              if (result.indexOf(directVideos[vi]) < 0) result.push(directVideos[vi]);
+            }
+          } catch (_) {}
+          try {
+            var elements = root.querySelectorAll('*');
+            var limit = Math.min(elements.length, 1800 - scannedNodes);
+            for (var ei = 0; ei < limit && roots.length < 24; ei++) {
+              scannedNodes++;
+              var shadow = elements[ei] && elements[ei].shadowRoot;
+              if (shadow && seenRoots.indexOf(shadow) < 0 && roots.indexOf(shadow) < 0) {
+                roots.push(shadow);
+                shadowRoots++;
+              }
+            }
+          } catch (_) {}
+        }
+        return { videos: result.slice(0, 12), shadowRoots: shadowRoots };
+      }
+
+      function scheduleFrameScan() {
+        if (scanScheduled) return;
+        scanScheduled = true;
+        setTimeout(function(){ scanScheduled = false; sendFrameVideoState(); }, 180);
+      }
+
+      function sendFrameVideoState() {
+        try {
+          frameFlashvarsStats = { objects: 0, definitions: 0, qualities: [], videoDuration: 0, explicitAd: false,
+            xhamsterStateFound: false, xhamsterSourceCount: 0, xhamsterQualities: [], xhamsterOpaqueCount: 0, xhamsterSeen: Object.create(null) };
+          var bridge = window.VideoBrowserCapture;
+          if (!bridge || typeof bridge.postMessage !== 'function') return;
+          var found = collectFrameVideos();
+          var nodes = found.videos;
+          var lightVideoCount = 0;
+          var shadowVideoCount = 0;
+          for (var ci = 0; ci < nodes.length; ci++) {
+            try {
+              var rootNode = nodes[ci].getRootNode ? nodes[ci].getRootNode() : document;
+              if (rootNode && rootNode !== document) shadowVideoCount++; else lightVideoCount++;
+            } catch (_) { lightVideoCount++; }
+          }
+          var videos = [];
+          if (!nodes.length) {
+            sendFrameProbe('scan-no-video', 0, 0, found.shadowRoots);
+            return;
+          }
+          for (var i = 0; i < Math.min(nodes.length, 8); i++) {
+            var video = nodes[i];
+            if (!video) continue;
+            if (!video.__vbFrameVideoId) video.__vbFrameVideoId = 'fv-' + (++frameVideoCounter).toString(36);
+            var src = String(video.currentSrc || video.getAttribute('src') || '');
+            var sources = frameMediaSources(video);
+            var currentAd = frameAd(video, src);
+            if (currentAd) {
+              // Keep explicit player renditions plus recent manifest candidates during preroll.
+              // Native Kotlin verifies manifest duration before displaying any rendition,
+              // and the Resource-Timing collector rejects manifests older than a content transition.
+              sources = sources.filter(function(item){
+                return item.meta.captureSource === 'player-flashvars' || item.meta.captureSource === 'player-xhamster' ||
+                  item.meta.captureSource === 'performance-manifest';
+              });
+            }
+            var sourceKey = src + '||' + sources.map(function(item){ return item.url; }).join('||');
+            var previous = frameVideoLast[video.__vbFrameVideoId] || { key: '', epoch: 0, cycle: 0, sentAt: 0 };
+            if (previous.key && previous.key !== sourceKey) previous.epoch++;
+            if (video.ended && !previous.ended) previous.cycle++;
+            previous.key = sourceKey;
+            previous.ended = !!video.ended;
+            var rect = video.getBoundingClientRect();
+            var playing = !video.paused && !video.ended;
+            var inBounds = frameVisible(video);
+            var pointerHit = Date.now() - pointerState.at <= 12000 && pointerState.x >= rect.left && pointerState.x <= rect.right &&
+              pointerState.y >= rect.top && pointerState.y <= rect.bottom;
+            if (pointerHit) video.__vbFrameUserInitiated = true;
+            var gesture = video.__vbFrameUserInitiated === true;
+            var meta = sources.map(function(item){ return { url:item.url, label:item.meta.label || '',
+              width:Number(item.meta.width || 0), height:Number(item.meta.height || 0), mime:item.meta.mime || '',
+              captureSource:item.meta.captureSource || '', codec:item.meta.codec || '',
+              frameRate:Number(item.meta.frameRate || 0), dynamicRange:item.meta.dynamicRange || '',
+              bandwidth:Number(item.meta.bandwidth || 0), representationId:item.meta.representationId || '' }; });
+            videos.push({
+              id: video.__vbFrameVideoId, src: src, sources: sources.map(function(item){ return item.url; }),
+              sourceMeta: meta, poster: String(video.poster || ''),
+              duration: Number.isFinite(Number(video.duration)) ? Number(video.duration) : 0,
+              currentTime: Number(video.currentTime || 0), paused: !!video.paused, ended: !!video.ended,
+              playing: playing, visible: inBounds, area: Math.max(0, Number(rect.width || 0) * Number(rect.height || 0)),
+              width: Number(video.videoWidth || 0), height: Number(video.videoHeight || 0),
+              ad: currentAd, adReason: frameFlashvarsStats.explicitAd ? 'player-ad-flag' :
+                (frameFlashvarsStats.videoDuration > 20 && Number(video.duration || 0) > 0 &&
+                 Number(video.duration || 0) < frameFlashvarsStats.videoDuration - Math.max(15, frameFlashvarsStats.videoDuration * 0.15) &&
+                 Number(video.duration || 0) / frameFlashvarsStats.videoDuration < 0.80 ? 'player-duration-mismatch' : ''),
+              playerVideoDuration: Number(frameFlashvarsStats.videoDuration || 0),
+              gesture: gesture, sourceEpoch: previous.epoch, cycle: previous.cycle,
+              blob: /^blob:/i.test(src)
+            });
+            if (Date.now() - previous.sentAt > 900 || playing || sourceKey !== previous.lastSentKey) {
+              previous.sentAt = Date.now();
+              previous.lastSentKey = sourceKey;
+            }
+            frameVideoLast[video.__vbFrameVideoId] = previous;
+          }
+          if (!videos.length) return;
+          bridge.postMessage(JSON.stringify({
+            kind: 'frame-video-state', frameId: frameId, frameOrigin: String(location.origin || ''),
+            isTop: frameIsTop, shadowRootCount: found.shadowRoots,
+            lightVideoCount: lightVideoCount, shadowVideoCount: shadowVideoCount,
+            playerConfigObjectCount: frameFlashvarsStats.objects,
+            playerMediaDefinitionCount: frameFlashvarsStats.definitions,
+            playerDefinitionQualities: frameFlashvarsStats.qualities,
+            playerVideoDuration: frameFlashvarsStats.videoDuration,
+            playerExplicitAd: frameFlashvarsStats.explicitAd,
+            xhamsterStateFound: frameFlashvarsStats.xhamsterStateFound,
+            xhamsterSourceCount: frameFlashvarsStats.xhamsterSourceCount,
+            xhamsterQualities: frameFlashvarsStats.xhamsterQualities,
+            xhamsterOpaqueCount: frameFlashvarsStats.xhamsterOpaqueCount,
+            at: Date.now(), videos: videos
+          }));
+          sendFrameProbe('scan-video-found', lightVideoCount, shadowVideoCount, found.shadowRoots);
+        } catch (_) {}
+      }
+
+      function framePointer(event) {
+        try {
+          var p = event.touches && event.touches.length ? event.touches[0] : event;
+          pointerState = { x: Number(p.clientX || -1), y: Number(p.clientY || -1), at: Date.now() };
+          var nodes = collectFrameVideos().videos;
+          for (var vi = 0; vi < nodes.length; vi++) {
+            var video = nodes[vi];
+            var rect = video.getBoundingClientRect();
+            if (pointerState.x >= rect.left && pointerState.x <= rect.right &&
+                pointerState.y >= rect.top && pointerState.y <= rect.bottom) {
+              video.__vbFrameUserInitiated = true;
+              video.__vbFrameUserInitiatedAt = Date.now();
+            }
+          }
+          sendFrameVideoState();
+        } catch (_) {}
+      }
+      document.addEventListener('pointerdown', framePointer, true);
+      document.addEventListener('touchstart', framePointer, true);
+      ['play','playing','loadedmetadata','loadeddata','durationchange','emptied','ended','pause','canplay'].forEach(function(name){
+        document.addEventListener(name, function(){ sendFrameVideoState(); }, true);
+      });
+      try {
+        if (window.MutationObserver) observeShadowRoot(document);
+      } catch (_) {}
+      if (window.setInterval) window.setInterval(function(){ sendFrameProbe('periodic', 0, 0, observedRoots.length - 1); sendFrameVideoState(); }, 1500);
+      sendFrameVideoState();
+    }
+  } catch (_) {}
+})();
+"""
